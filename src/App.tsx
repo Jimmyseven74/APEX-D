@@ -1,12 +1,34 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useRef, useState, type FormEvent, type ReactNode } from "react";
 import { isPlausibleReg, lookup, normalise, type Status, type VehicleResult } from "./lookup";
+import { BottomSheet, SheetHeader, SheetRow, SHEET_CLOSE_MS } from "./Sheet";
+import {
+  IconBellOff,
+  IconCalendar,
+  IconCamera,
+  IconCheck,
+  IconDone,
+  IconPdf,
+  IconPhotos,
+  IconScan,
+  IconSnooze,
+  IconTurnOff,
+} from "./icons";
 
 /*
-  Navigation follows the design system (Notion change log v01):
+  Figma (APEX DREAMS — Design System v01) is the source of truth for copy, layout and tokens.
+  Navigation follows the design system:
   - Top bar types: Root (tab destinations), Back (drill-down), Close (task flows).
   - Tabs: Home, My Garage, Account. Tabs go to their root screen.
   - Before sign-up (J1) there is no tab bar; after sign-up the user lands in the app.
+  - Bottom sheets: J1 reminder offer and notifications off, J2/J3 add invoice,
+    J5 reminder actions and snooze.
 */
+
+type Cat = "mot" | "tax";
+
+type DateInfo = { status: Status; date: string; source: "official" | "owner"; official?: string };
+
+type Doc = { id: string; name: string };
 
 type Car = {
   id: string;
@@ -15,11 +37,15 @@ type Car = {
   model: string;
   year: number | null;
   colour?: string;
-  mot?: VehicleResult["mot"];
-  tax?: VehicleResult["tax"];
+  mot?: DateInfo;
+  tax?: DateInfo;
   retrievedAt?: string;
   source: "lookup" | "owner";
   reminders: boolean;
+  channel?: "push" | "email";
+  off: Partial<Record<Cat, boolean>>;
+  snoozed: Partial<Record<Cat, string>>;
+  documents: Doc[];
 };
 
 type Tab = "home" | "garage" | "account";
@@ -30,28 +56,75 @@ type Flow =
   | { name: "loading" }
   | { name: "confirm"; car: Car }
   | { name: "manual"; reg: string }
-  | { name: "signup"; car: Car }
-  | { name: "reminders"; car: Car };
+  | { name: "signup"; car: Car };
+
+// Full-screen task flows opened from the reminder actions sheet (J5 06–08, 11; J2 06).
+type TaskStep = "update" | "compare" | "done" | "next" | "uptodate";
 
 type View =
   | { kind: "onboarding"; flow: Flow }
   | { kind: "tab"; tab: Tab }
   | { kind: "vehicle"; id: string; from: Tab }
-  | { kind: "add"; flow: Flow; from: Tab };
+  | { kind: "add"; flow: Flow; from: Tab }
+  | { kind: "task"; id: string; cat: Cat; step: TaskStep; draft: string; choice?: "official" | "owner"; from: Tab };
 
+type Snooze = "tomorrow" | "week" | "pick";
+
+type Sheet =
+  | { kind: "offer"; carId: string; step: "offer" | "blocked" }
+  | { kind: "actions"; carId: string; cat: Cat; step: "menu" | "snooze"; snooze: Snooze; pick: string }
+  | { kind: "docs"; carId: string };
+
+type Toast = { msg: string; action?: { label: string; run: () => void } };
+
+/* ---------- Dates ---------- */
+
+const DAY = 86_400_000;
+const isoDay = (d: Date) => d.toISOString().slice(0, 10);
+const todayIso = () => isoDay(new Date());
+const addDays = (iso: string, n: number) => isoDay(new Date(new Date(iso).getTime() + n * DAY));
+const addYears = (iso: string, n: number) => {
+  const d = new Date(iso);
+  d.setFullYear(d.getFullYear() + n);
+  return isoDay(d);
+};
 const fmtDate = (iso: string) =>
   new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+const fmtShort = (iso: string) => new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+
+function statusFor(iso: string): Status {
+  const days = (new Date(iso).getTime() - new Date(todayIso()).getTime()) / DAY;
+  if (days < 0) return "expired";
+  if (days <= 30) return "due-soon";
+  return "valid";
+}
 
 const STATUS: Record<Status, { icon: string; label: string }> = {
-  valid: { icon: "✓", label: "Valid" },
+  valid: { icon: "✓", label: "Up to date" },
   "due-soon": { icon: "!", label: "Due soon" },
   expired: { icon: "✕", label: "Expired" },
 };
 
+const CAT_LABEL: Record<Cat, string> = { mot: "MOT", tax: "Tax" };
+
 let idSeq = 0;
-const newId = () => `car-${Date.now()}-${idSeq++}`;
+const newId = (p = "car") => `${p}-${Date.now()}-${idSeq++}`;
 
 const carName = (c: Car) => `${c.make} ${c.model}`;
+
+const fromLookup = (v: VehicleResult): Car => ({
+  ...v,
+  mot: { ...v.mot, source: "official", official: v.mot.date },
+  tax: { ...v.tax, source: "official", official: v.tax.date },
+  id: newId(),
+  source: "lookup",
+  reminders: false,
+  off: {},
+  snoozed: {},
+  documents: [],
+});
+
+const reduceMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 
 /* ---------- Shared UI ---------- */
 
@@ -116,21 +189,40 @@ function TabBar({ active, onSelect }: { active: Tab | null; onSelect: (t: Tab) =
   );
 }
 
-function StatusRow({ title, status, date }: { title: string; status: Status; date: string }) {
-  const s = STATUS[status];
-  const verb = status === "expired" ? "Expired" : title === "MOT" ? "Expires" : "Due";
-  return (
-    <div className="status-row">
+function StatusRow({
+  title,
+  info,
+  onClick,
+  note,
+}: {
+  title: string;
+  info: DateInfo;
+  onClick?: () => void;
+  note?: ReactNode;
+}) {
+  const s = STATUS[info.status];
+  const verb = info.status === "expired" ? "Expired" : title === "MOT" ? "Expires" : "Due";
+  const inner = (
+    <>
       <div>
         <div className="status-title">{title}</div>
         <div className="status-date">
-          {verb} {fmtDate(date)}
+          {verb} {fmtDate(info.date)}
         </div>
+        <span className="tag tag-inline">{info.source === "owner" ? "Owner-added" : "Sample data"}</span>
+        {note}
       </div>
-      <span className={`pill pill-${status}`}>
+      <span className={`pill pill-${info.status}`}>
         <span aria-hidden="true">{s.icon}</span> {s.label}
       </span>
-    </div>
+    </>
+  );
+  return onClick ? (
+    <button type="button" className="status-row as-button" onClick={onClick} aria-label={`${title}: manage reminder`}>
+      {inner}
+    </button>
+  ) : (
+    <div className="status-row">{inner}</div>
   );
 }
 
@@ -150,14 +242,22 @@ function CarHeader({ car }: { car: Car }) {
   );
 }
 
-function Dates({ car }: { car: Car }) {
+function Dates({ car, onManage }: { car: Car; onManage?: (cat: Cat) => void }) {
   if (!car.mot || !car.tax) {
     return <p className="muted note">No MOT or tax data. Add the dates yourself once the car is saved.</p>;
   }
+  const offNote = (cat: Cat) =>
+    car.off[cat] ? (
+      <p className="inline-note">
+        {CAT_LABEL[cat]} reminders are off for {carName(car)}. You’ll still see the due date here and on Home.
+      </p>
+    ) : car.snoozed[cat] ? (
+      <p className="inline-note">Snoozed until {fmtDate(car.snoozed[cat]!)}</p>
+    ) : null;
   return (
     <>
-      <StatusRow title="MOT" status={car.mot.status} date={car.mot.date} />
-      <StatusRow title="Tax" status={car.tax.status} date={car.tax.date} />
+      <StatusRow title="MOT" info={car.mot} onClick={onManage && (() => onManage("mot"))} note={offNote("mot")} />
+      <StatusRow title="Tax" info={car.tax} onClick={onManage && (() => onManage("tax"))} note={offNote("tax")} />
       <p className="source">
         Sample data for preview only, not from DVLA or DVSA.
         {car.retrievedAt ? ` Checked ${fmtDate(car.retrievedAt)}.` : ""}
@@ -199,7 +299,7 @@ function AddCarFlow({
     setFlow({ name: "loading" });
     const v = await lookup(reg);
     if (v) {
-      setFlow({ name: "confirm", car: { ...v, id: newId(), source: "lookup", reminders: false } });
+      setFlow({ name: "confirm", car: fromLookup(v) });
     } else {
       setFlow({ name: "manual", reg: reg.toUpperCase().trim() });
     }
@@ -220,11 +320,15 @@ function AddCarFlow({
       year: Number.isFinite(yearRaw) && yearRaw > 1885 ? yearRaw : null,
       source: "owner",
       reminders: false,
+      off: {},
+      snoozed: {},
+      documents: [],
     };
-    setFlow(signedIn ? { name: "reminders", car } : { name: "signup", car });
+    if (signedIn) onDone(car);
+    else setFlow({ name: "signup", car });
   }
 
-  const afterConfirm = (car: Car) => setFlow(signedIn ? { name: "reminders", car } : { name: "signup", car });
+  const afterConfirm = (car: Car) => (signedIn ? onDone(car) : setFlow({ name: "signup", car }));
 
   if (flow.name === "entry" || flow.name === "loading") {
     return (
@@ -328,46 +432,24 @@ function AddCarFlow({
     );
   }
 
-  if (flow.name === "signup") {
-    return (
-      <div className="card">
-        <h2>Save your car</h2>
-        <p className="muted">Create a free account to keep your car and get reminders.</p>
-        <div className="actions">
-          {["Continue with Apple", "Continue with Google", "Continue with email"].map((label) => (
-            <button
-              key={label}
-              className={label.includes("Apple") ? "btn-primary" : "btn-secondary"}
-              type="button"
-              onClick={() => setFlow({ name: "reminders", car: flow.car })}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-        <p className="source">Prototype: no account is created.</p>
-      </div>
-    );
-  }
-
-  // reminders
-  const car = flow.car;
+  // signup
   return (
     <div className="card">
-      <h2>Get a reminder before it's due?</h2>
-      <p className="muted">
-        {car.mot
-          ? `The MOT on ${car.registration} ${car.mot.status === "expired" ? "expired" : "is due"} ${fmtDate(car.mot.date)}. We'll remind you 2 weeks before.`
-          : "Add MOT, tax, insurance and service dates and we'll remind you 2 weeks before each one."}
-      </p>
+      <h2>Save your car</h2>
+      <p className="muted">Create a free account to keep your car and get reminders.</p>
       <div className="actions">
-        <button className="btn-primary" type="button" onClick={() => onDone({ ...car, reminders: true })}>
-          Turn on reminders
-        </button>
-        <button className="btn-secondary" type="button" onClick={() => onDone({ ...car, reminders: false })}>
-          Not now
-        </button>
+        {["Continue with Apple", "Continue with Google", "Continue with email"].map((label) => (
+          <button
+            key={label}
+            className={label.includes("Apple") ? "btn-primary" : "btn-secondary"}
+            type="button"
+            onClick={() => onDone(flow.car)}
+          >
+            {label}
+          </button>
+        ))}
       </div>
+      <p className="source">Prototype: no account is created.</p>
     </div>
   );
 }
@@ -379,8 +461,8 @@ type DueItem = { car: Car; label: "MOT" | "Tax"; status: Status; date: string };
 function dueItems(cars: Car[]): DueItem[] {
   const items: DueItem[] = [];
   for (const car of cars) {
-    if (car.mot) items.push({ car, label: "MOT", ...car.mot });
-    if (car.tax) items.push({ car, label: "Tax", ...car.tax });
+    if (car.mot) items.push({ car, label: "MOT", status: car.mot.status, date: car.mot.date });
+    if (car.tax) items.push({ car, label: "Tax", status: car.tax.status, date: car.tax.date });
   }
   return items.sort((a, b) => a.date.localeCompare(b.date));
 }
@@ -512,35 +594,225 @@ function VehicleScreen({
   onToggleReminders,
   onFlash,
   onRemove,
+  onManage,
+  onAddDocument,
 }: {
   car: Car;
   onToggleReminders: () => void;
   onFlash: (m: string) => void;
   onRemove: () => void;
+  onManage: (cat: Cat) => void;
+  onAddDocument: () => void;
 }) {
   return (
     <div className="card">
       <CarHeader car={car} />
-      <Dates car={car} />
+      <Dates car={car} onManage={onManage} />
       <div className="status-row">
         <div>
           <div className="status-title">Reminders</div>
-          <div className="status-date">{car.reminders ? "On · 2 weeks before" : "Off"}</div>
+          <div className="status-date">
+            {car.reminders ? `On · ${car.channel === "email" ? "email · " : ""}2 weeks before` : "Off"}
+          </div>
         </div>
         <button className="btn-small" type="button" onClick={onToggleReminders}>
           {car.reminders ? "Turn off" : "Turn on"}
         </button>
       </div>
+      {car.documents.length > 0 && (
+        <div className="docs">
+          <div className="status-title">Documents</div>
+          <ul>
+            {car.documents.map((d) => (
+              <li key={d.id}>
+                <IconPdf /> <span>{d.name}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <div className="tiles">
-        {["Set insurance date", "Set service date", "Add a document"].map((t) => (
+        {["Set insurance date", "Set service date"].map((t) => (
           <button key={t} className="tile" type="button" onClick={() => onFlash(`${t}: coming in the app`)}>
             <span aria-hidden="true">＋</span> {t}
           </button>
         ))}
+        <button className="tile" type="button" onClick={onAddDocument}>
+          <span aria-hidden="true">＋</span> Add a document
+        </button>
       </div>
       <button className="link danger" type="button" onClick={onRemove}>
         Remove this car
       </button>
+    </div>
+  );
+}
+
+/* ---------- Task screens opened from reminder actions (Figma J5 06–08, 11; J2 06) ---------- */
+
+function DateField({ id, label, hint, value, onChange }: { id: string; label: string; hint: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="field">
+      <label htmlFor={id} className="field-label">
+        {label}
+      </label>
+      <p id={`${id}-hint`} className="field-hint">
+        {hint}
+      </p>
+      <input id={id} type="date" value={value} onChange={(e) => onChange(e.target.value)} aria-describedby={`${id}-hint`} />
+    </div>
+  );
+}
+
+function TaskScreen({
+  car,
+  view,
+  setView,
+  onSave,
+  onCheckOfficial,
+  onAddCertificate,
+}: {
+  car: Car;
+  view: Extract<View, { kind: "task" }>;
+  setView: (v: View) => void;
+  onSave: (date: string, source: "official" | "owner", after: TaskStep | "vehicle") => void;
+  onCheckOfficial: () => void;
+  onAddCertificate: () => void;
+}) {
+  const label = CAT_LABEL[view.cat];
+  const info = car[view.cat]!;
+  const set = (patch: Partial<Extract<View, { kind: "task" }>>) => setView({ ...view, ...patch });
+
+  if (view.step === "update") {
+    const save = () => {
+      if (!view.draft) return;
+      if (info.official && view.draft !== info.official) set({ step: "compare", choice: "official" });
+      else onSave(view.draft, info.official && view.draft === info.official ? "official" : "owner", "vehicle");
+    };
+    return (
+      <div className="task">
+        <DateField
+          id="due"
+          label={`${label} due date`}
+          hint={view.cat === "mot" ? "Use the date on your latest MOT certificate" : "Use the date on your latest tax reminder"}
+          value={view.draft}
+          onChange={(v) => set({ draft: v })}
+        />
+        {info.official && (
+          <>
+            <button className="link" type="button" onClick={onCheckOfficial}>
+              Check with {view.cat === "mot" ? "DVSA" : "DVLA"} instead
+            </button>
+            <p className="muted small">
+              If your date is different from {view.cat === "mot" ? "DVSA" : "DVLA"}’s, we’ll show both and you choose.
+            </p>
+          </>
+        )}
+        <div className="task-foot">
+          <button className="btn-primary" type="button" onClick={save} disabled={!view.draft}>
+            Save date
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (view.step === "compare" && info.official) {
+    const opts: Array<{ k: "official" | "owner"; date: string; tag: string; sub: string }> = [
+      { k: "official", date: info.official, tag: "Sample data", sub: `From ${view.cat === "mot" ? "DVSA" : "DVLA"} (sample), retrieved ${car.retrievedAt ? fmtDate(car.retrievedAt) : "today"}` },
+      { k: "owner", date: view.draft, tag: "Owner-added", sub: "You entered this today" },
+    ];
+    return (
+      <div className="task">
+        <h2 className="task-title">Which {label} date should we use?</h2>
+        <div className="choices" role="radiogroup" aria-label={`${label} date`}>
+          {opts.map((o) => (
+            <button
+              key={o.k}
+              type="button"
+              role="radio"
+              aria-checked={view.choice === o.k}
+              className={`choice ${view.choice === o.k ? "selected" : ""}`}
+              onClick={() => set({ choice: o.k })}
+            >
+              <span className="radio" aria-hidden="true" />
+              <span>
+                <span className="choice-date">{fmtDate(o.date)}</span>
+                <span className="tag tag-inline">{o.tag}</span>
+                <span className="choice-sub">{o.sub}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+        <p className="muted small">Until you choose, reminders follow the earlier date.</p>
+        <div className="task-foot">
+          <button
+            className="btn-primary"
+            type="button"
+            onClick={() => onSave(view.choice === "owner" ? view.draft : info.official!, view.choice === "owner" ? "owner" : "official", "vehicle")}
+          >
+            Use this date
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (view.step === "done") {
+    return (
+      <div className="task">
+        <div className="all-clear-block">
+          <span className="all-clear-icon">
+            <IconDone />
+          </span>
+          <h2 className="task-title">{label} marked as done</h2>
+          <p className="muted">Nice one. Want to keep the certificate or invoice with {carName(car)}?</p>
+        </div>
+        <div className="task-foot">
+          <button className="btn-primary" type="button" onClick={onAddCertificate}>
+            Add certificate or invoice
+          </button>
+          <button className="btn-secondary" type="button" onClick={() => set({ step: "next", draft: addYears(info.date, 1) })}>
+            Not now
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (view.step === "next") {
+    return (
+      <div className="task">
+        <h2 className="task-title">When is the next {label} due?</h2>
+        <DateField
+          id="next"
+          label={`Next ${label} due`}
+          hint={view.cat === "mot" ? "Usually a year after this one. It’s on your new certificate." : "Usually a year after this one."}
+          value={view.draft}
+          onChange={(v) => set({ draft: v })}
+        />
+        <div className="task-foot">
+          <button className="btn-primary" type="button" disabled={!view.draft} onClick={() => onSave(view.draft, "owner", "uptodate")}>
+            Save and set reminder
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // uptodate
+  return (
+    <div className="card">
+      <div className="all-clear-block">
+        <span className="all-clear-icon">
+          <IconDone />
+        </span>
+        <h2 className="task-title">You’re up to date</h2>
+        <p className="muted">
+          We'll remind you 2 weeks before your next {label} on {fmtDate(info.date)}.
+        </p>
+      </div>
+      <StatusRow title={label} info={info} />
     </div>
   );
 }
@@ -552,28 +824,54 @@ const TITLES: Record<Tab, string> = { home: "Home", garage: "My Garage", account
 export default function App() {
   const [cars, setCars] = useState<Car[]>([]);
   const [view, setView] = useState<View>({ kind: "onboarding", flow: { name: "entry" } });
-  const [toast, setToast] = useState("");
+  const [toast, setToast] = useState<Toast | null>(null);
+  const [sheet, setSheet] = useState<Sheet | null>(null);
+  const [sheetClosing, setSheetClosing] = useState(false);
+  const toastTimer = useRef<number>(0);
+  const fileInputs = useRef<Record<string, HTMLInputElement | null>>({});
 
-  const flash = (msg: string) => {
-    setToast(msg);
-    window.setTimeout(() => setToast(""), 2500);
+  const flash = (msg: string, action?: Toast["action"]) => {
+    window.clearTimeout(toastTimer.current);
+    setToast({ msg, action });
+    toastTimer.current = window.setTimeout(() => setToast(null), action ? 5000 : 2500);
+  };
+
+  const updateCar = (id: string, fn: (c: Car) => Car) => setCars((cs) => cs.map((c) => (c.id === id ? fn(c) : c)));
+
+  const openSheet = (s: Sheet) => {
+    setSheetClosing(false);
+    setSheet(s);
+  };
+  const closeSheet = (after?: () => void) => {
+    setSheetClosing(true);
+    window.setTimeout(() => {
+      setSheet(null);
+      setSheetClosing(false);
+      after?.();
+    }, reduceMotion() ? 0 : SHEET_CLOSE_MS);
   };
 
   const signedIn = view.kind !== "onboarding";
-  const activeTab: Tab | null =
-    view.kind === "tab" ? view.tab : view.kind === "vehicle" || view.kind === "add" ? view.from : null;
+  const activeTab: Tab | null = view.kind === "tab" ? view.tab : view.kind === "onboarding" ? null : view.from;
 
   const openVehicle = (id: string, from: Tab) => setView({ kind: "vehicle", id, from });
   const startAdd = (from: Tab) => setView({ kind: "add", flow: { name: "entry" }, from });
+  const viewOnHome = { label: "View on Home", run: () => setView({ kind: "tab", tab: "home" }) };
 
+  const savedMsg = (car: Car) => `${car.registration || carName(car)} saved to your garage`;
+
+  // J1: after saving, the vehicle page appears and the reminder offer slides up 0.6s later —
+  // only when there is a real MOT or tax date to remind about.
   const saveCar = (car: Car) => {
     setCars((cs) => [...cs, car]);
     setView({ kind: "vehicle", id: car.id, from: "garage" });
-    flash(`${car.registration || carName(car)} saved to your garage`);
+    if (car.mot || car.tax) window.setTimeout(() => openSheet({ kind: "offer", carId: car.id, step: "offer" }), 600);
+    else flash(savedMsg(car));
   };
 
   const restart = () => {
     setCars([]);
+    setSheet(null);
     setView({ kind: "onboarding", flow: { name: "entry" } });
   };
 
@@ -585,16 +883,253 @@ export default function App() {
         return { name: "entry" };
       case "signup":
         return flow.car.source === "lookup" ? { name: "confirm", car: flow.car } : { name: "manual", reg: flow.car.registration };
-      case "reminders":
-        return signedIn
-          ? flow.car.source === "lookup"
-            ? { name: "confirm", car: flow.car }
-            : { name: "manual", reg: flow.car.registration }
-          : null; // after sign-up there's no going back to sign-up
       default:
         return null;
     }
   };
+
+  /* ----- Sheet content ----- */
+
+  const sheetCar = sheet ? cars.find((c) => c.id === sheet.carId) : undefined;
+
+  function renderSheet(): ReactNode {
+    if (!sheet || !sheetCar) return null;
+    const car = sheetCar;
+
+    if (sheet.kind === "offer") {
+      const notNow = () => closeSheet(() => flash(savedMsg(car)));
+      if (sheet.step === "offer") {
+        const first = [car.mot && { cat: "mot" as Cat, ...car.mot }, car.tax && { cat: "tax" as Cat, ...car.tax }]
+          .filter(Boolean)
+          .sort((a, b) => (a as DateInfo).date.localeCompare((b as DateInfo).date))[0] as (DateInfo & { cat: Cat });
+        const what = first.cat === "mot" ? "MOT" : "tax";
+        return (
+          <div className="sheet-body">
+            <button
+              type="button"
+              className="notif-preview"
+              onClick={() => openSheet({ ...sheet, step: "blocked" })}
+              aria-label="Notification preview. Prototype: tap to see what happens if notifications are blocked."
+            >
+              <span className="notif-icon" aria-hidden="true">
+                AD
+              </span>
+              <span className="notif-text">
+                <span className="notif-app">APEX DREAMS</span>
+                <span className="notif-msg">
+                  {carName(car)} {car.registration}: {first.cat === "mot" ? "MOT" : "Tax"} due {fmtShort(first.date)}. Source:{" "}
+                  {first.cat === "mot" ? "DVSA" : "DVLA"} (sample data).
+                </span>
+              </span>
+            </button>
+            <h2 id="sheet-title" className="sheet-title">
+              Remind you 2 weeks before your {what} on {fmtShort(first.date)}?
+            </h2>
+            <p className="sheet-text">
+              We’ll remind you about MOT and tax for this car. You can change this anytime in reminder settings.
+            </p>
+            <div className="sheet-actions">
+              <button
+                className="btn-primary"
+                type="button"
+                onClick={() => {
+                  updateCar(car.id, (c) => ({ ...c, reminders: true, channel: "push" }));
+                  closeSheet(() => flash("Reminders on for MOT and tax"));
+                }}
+              >
+                Remind me
+              </button>
+              <button className="btn-secondary" type="button" onClick={notNow}>
+                Not now
+              </button>
+            </div>
+            <p className="source">Prototype: tap the notification to see what happens if notifications are blocked.</p>
+          </div>
+        );
+      }
+      return (
+        <div className="sheet-body">
+          <span className="icon-tile" aria-hidden="true">
+            <IconBellOff />
+          </span>
+          <h2 id="sheet-title" className="sheet-title">
+            Notifications are off for APEX DREAMS
+          </h2>
+          <p className="sheet-text">
+            To get reminders, open your phone's Settings, tap Notifications, then APEX DREAMS, and turn on Allow
+            Notifications. Or we can email you instead.
+          </p>
+          <div className="sheet-actions">
+            <button className="btn-primary" type="button" onClick={notNow}>
+              Open Settings
+            </button>
+            <button
+              className="btn-secondary"
+              type="button"
+              onClick={() => {
+                updateCar(car.id, (c) => ({ ...c, reminders: true, channel: "email" }));
+                closeSheet(() => flash("Reminders on for MOT and tax"));
+              }}
+            >
+              Email me instead
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    if (sheet.kind === "docs") {
+      const pick = (key: string) => fileInputs.current[key]?.click();
+      return (
+        <>
+          <SheetHeader id="sheet-title" title={`Add invoice to ${carName(car)}`} onClose={() => closeSheet()} />
+          <div className="sheet-rows">
+            <SheetRow icon={<IconScan />} label="Scan document" onClick={() => pick("scan")} />
+            <SheetRow icon={<IconCamera />} label="Take photo" onClick={() => pick("camera")} />
+            <SheetRow icon={<IconPhotos />} label="Choose from photos" onClick={() => pick("photos")} />
+            <SheetRow icon={<IconPdf />} label="Choose a PDF" onClick={() => pick("pdf")} />
+          </div>
+        </>
+      );
+    }
+
+    // Reminder actions (J5)
+    const info = car[sheet.cat];
+    if (!info) return null;
+    const label = CAT_LABEL[sheet.cat];
+    if (sheet.step === "menu") {
+      const active = car.reminders && !car.off[sheet.cat];
+      const toTask = (step: TaskStep, draft: string) =>
+        closeSheet(() => {
+          setToast(null);
+          setView({ kind: "task", id: car.id, cat: sheet.cat, step, draft, from: activeTab ?? "garage" });
+        });
+      return (
+        <>
+          <SheetHeader id="sheet-title" title={`${carName(car)} · ${label} due ${fmtShort(info.date)}`} onClose={() => closeSheet()} />
+          <div className="sheet-rows">
+            <SheetRow icon={<IconCalendar />} label="Update date" onClick={() => toTask("update", info.date)} />
+            <SheetRow icon={<IconDone />} label="Mark as done" onClick={() => toTask("done", info.date)} />
+            {active && (
+              <SheetRow
+                icon={<IconSnooze />}
+                label="Snooze"
+                onClick={() => openSheet({ ...sheet, step: "snooze", snooze: "tomorrow", pick: addDays(todayIso(), 3) })}
+              />
+            )}
+            {active ? (
+              <SheetRow
+                icon={<IconTurnOff />}
+                label="Turn off this reminder"
+                destructive
+                onClick={() => {
+                  const cat = sheet.cat;
+                  updateCar(car.id, (c) => ({ ...c, off: { ...c.off, [cat]: true } }));
+                  closeSheet(() =>
+                    flash(`Reminder off for ${carName(car)} ${label}`, {
+                      label: "Undo",
+                      run: () => {
+                        updateCar(car.id, (c) => ({ ...c, off: { ...c.off, [cat]: false } }));
+                        setToast(null);
+                      },
+                    }),
+                  );
+                }}
+              />
+            ) : (
+              <SheetRow
+                icon={<IconSnooze />}
+                label="Turn on this reminder"
+                onClick={() => {
+                  const cat = sheet.cat;
+                  updateCar(car.id, (c) => ({ ...c, reminders: true, channel: c.channel ?? "push", off: { ...c.off, [cat]: false } }));
+                  closeSheet(() => flash(`${label} reminder on for ${carName(car)}`));
+                }}
+              />
+            )}
+          </div>
+        </>
+      );
+    }
+
+    // Snooze (sheet-to-sheet)
+    const until = sheet.snooze === "tomorrow" ? addDays(todayIso(), 1) : sheet.snooze === "week" ? addDays(todayIso(), 7) : sheet.pick;
+    const btn = sheet.snooze === "tomorrow" ? "Snooze until tomorrow" : sheet.snooze === "week" ? "Snooze until next week" : `Snooze until ${fmtShort(sheet.pick)}`;
+    const chips: Array<{ k: Snooze; t: string }> = [
+      { k: "tomorrow", t: "Tomorrow" },
+      { k: "week", t: "Next week" },
+      { k: "pick", t: "Pick a date" },
+    ];
+    return (
+      <div className="sheet-body">
+        <h2 id="sheet-title" className="sheet-title">
+          Remind me again
+        </h2>
+        <div className="chips" role="radiogroup" aria-label="Snooze until">
+          {chips.map((c) => (
+            <button
+              key={c.k}
+              type="button"
+              role="radio"
+              aria-checked={sheet.snooze === c.k}
+              className={`chip ${sheet.snooze === c.k ? "selected" : ""}`}
+              onClick={() => openSheet({ ...sheet, snooze: c.k })}
+            >
+              {sheet.snooze === c.k && <IconCheck />}
+              {c.t}
+            </button>
+          ))}
+        </div>
+        {sheet.snooze === "pick" && (
+          <DateField
+            id="snooze-date"
+            label="Remind me on"
+            hint="We'll send it at 9am."
+            value={sheet.pick}
+            onChange={(v) => openSheet({ ...sheet, pick: v })}
+          />
+        )}
+        <div className="sheet-actions">
+          <button
+            className="btn-primary"
+            type="button"
+            disabled={!until}
+            onClick={() => {
+              const cat = sheet.cat;
+              const prev = car.snoozed[cat];
+              updateCar(car.id, (c) => ({ ...c, snoozed: { ...c.snoozed, [cat]: until } }));
+              closeSheet(() =>
+                flash(
+                  sheet.snooze === "tomorrow" ? "We'll remind you again tomorrow at 9am" : `We'll remind you again on ${fmtDate(until)} at 9am`,
+                  {
+                    label: "Undo",
+                    run: () => {
+                      updateCar(car.id, (c) => ({ ...c, snoozed: { ...c.snoozed, [cat]: prev } }));
+                      setToast(null);
+                    },
+                  },
+                ),
+              );
+            }}
+          >
+            {btn}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  function onFile(key: string, files: FileList | null) {
+    const file = files?.[0];
+    const s = sheet;
+    if (fileInputs.current[key]) fileInputs.current[key]!.value = "";
+    if (!file || !s || s.kind !== "docs" || !sheetCar) return;
+    const car = sheetCar;
+    updateCar(car.id, (c) => ({ ...c, documents: [...c.documents, { id: newId("doc"), name: file.name }] }));
+    closeSheet(() => flash(`Saved to ${carName(car)}`, viewOnHome));
+  }
+
+  /* ----- Screens ----- */
 
   let top: ReactNode;
   let body: ReactNode;
@@ -647,13 +1182,67 @@ export default function App() {
       <VehicleScreen
         car={car}
         onFlash={flash}
-        onToggleReminders={() =>
-          setCars((cs) => cs.map((c) => (c.id === car.id ? { ...c, reminders: !c.reminders } : c)))
-        }
+        onToggleReminders={() => updateCar(car.id, (c) => ({ ...c, reminders: !c.reminders, channel: c.channel ?? "push" }))}
         onRemove={() => {
           setCars((cs) => cs.filter((c) => c.id !== car.id));
           setView({ kind: "tab", tab: "garage" });
           flash("Car removed");
+        }}
+        onManage={(cat) => openSheet({ kind: "actions", carId: car.id, cat, step: "menu", snooze: "tomorrow", pick: "" })}
+        onAddDocument={() => openSheet({ kind: "docs", carId: car.id })}
+      />
+    ) : null;
+  } else if (view.kind === "task") {
+    const car = cars.find((c) => c.id === view.id);
+    const label = CAT_LABEL[view.cat];
+    const toVehicle = () => setView({ kind: "vehicle", id: view.id, from: view.from });
+    const titles: Record<TaskStep, string> = {
+      update: `Update ${label} date`,
+      compare: `${label} date`,
+      done: `${label} done`,
+      next: `Next ${label}`,
+      uptodate: car ? carName(car) : "",
+    };
+    const isBack = view.step === "compare" || view.step === "uptodate";
+    top = (
+      <TopBar
+        type={isBack ? "back" : "close"}
+        title={titles[view.step]}
+        onLeft={() => (view.step === "compare" ? setView({ ...view, step: "update" }) : toVehicle())}
+      />
+    );
+    body = car ? (
+      <TaskScreen
+        car={car}
+        view={view}
+        setView={setView}
+        onSave={(date, source, after) => {
+          const cat = view.cat;
+          updateCar(car.id, (c) => ({
+            ...c,
+            [cat]: { ...c[cat]!, date, source, status: statusFor(date) },
+            snoozed: { ...c.snoozed, [cat]: undefined },
+          }));
+          if (after === "uptodate") {
+            setToast(null);
+            setView({ ...view, step: "uptodate", draft: date });
+          }
+          else {
+            toVehicle();
+            flash(`Saved to ${carName(car)}`, viewOnHome);
+          }
+        }}
+        onCheckOfficial={() => {
+          const cat = view.cat;
+          updateCar(car.id, (c) => ({
+            ...c,
+            [cat]: { ...c[cat]!, date: c[cat]!.official!, source: "official", status: statusFor(c[cat]!.official!) },
+          }));
+          setView({ ...view, step: "uptodate" });
+        }}
+        onAddCertificate={() => {
+          toVehicle();
+          window.setTimeout(() => openSheet({ kind: "docs", carId: car.id }), 0);
         }}
       />
     ) : null;
@@ -671,12 +1260,18 @@ export default function App() {
   }
 
   // Tab bar shows on tab roots and drill-downs, not inside task flows (Close top bar) or before sign-up.
-  const showTabs = signedIn && view.kind !== "add";
+  const inTaskFlow = view.kind === "add" || (view.kind === "task" && view.step !== "uptodate");
+  const showTabs = signedIn && !inTaskFlow;
+
+  const sheetKey = sheet ? `${sheet.kind}-${"step" in sheet ? sheet.step : ""}` : "";
 
   return (
     <div className="app">
       {top}
-      <main className={`main ${showTabs ? "with-tabs" : ""}`} key={JSON.stringify([view.kind, "tab" in view ? view.tab : "", "id" in view ? view.id : ""])}>
+      <main
+        className={`main ${showTabs ? "with-tabs" : ""}`}
+        key={JSON.stringify([view.kind, "tab" in view ? view.tab : "", "id" in view ? view.id : "", "step" in view ? view.step : ""])}
+      >
         {body}
         {view.kind === "onboarding" && (view.flow.name === "entry" || view.flow.name === "loading") && (
           <section className="get-app">
@@ -691,11 +1286,34 @@ export default function App() {
         )}
       </main>
       {showTabs && <TabBar active={activeTab} onSelect={(t) => setView({ kind: "tab", tab: t })} />}
-      {toast && (
+      {toast && !sheet && (
         <div className={`toast ${showTabs ? "above-tabs" : ""}`} role="status">
-          {toast}
+          <span className="toast-icon" aria-hidden="true">
+            <IconDone />
+          </span>
+          <span className="toast-msg">{toast.msg}</span>
+          {toast.action && (
+            <button type="button" className="toast-action" onClick={toast.action.run}>
+              {toast.action.label}
+            </button>
+          )}
         </div>
       )}
+      {sheet && sheetCar && (
+        <BottomSheet closing={sheetClosing} onDismiss={() => {
+          if (sheet.kind === "offer") closeSheet(() => flash(savedMsg(sheetCar)));
+          else closeSheet();
+        }} labelledBy="sheet-title" contentKey={sheetKey}>
+          {renderSheet()}
+        </BottomSheet>
+      )}
+      {/* File pickers for the add-invoice sheet (Figma J2/J3 08). Nothing is uploaded; the file name is kept in this tab. */}
+      <div hidden>
+        <input ref={(el) => { fileInputs.current.scan = el; }} type="file" accept="image/*,application/pdf" capture="environment" onChange={(e) => onFile("scan", e.target.files)} />
+        <input ref={(el) => { fileInputs.current.camera = el; }} type="file" accept="image/*" capture="environment" onChange={(e) => onFile("camera", e.target.files)} />
+        <input ref={(el) => { fileInputs.current.photos = el; }} type="file" accept="image/*" onChange={(e) => onFile("photos", e.target.files)} />
+        <input ref={(el) => { fileInputs.current.pdf = el; }} type="file" accept="application/pdf" onChange={(e) => onFile("pdf", e.target.files)} />
+      </div>
     </div>
   );
 }

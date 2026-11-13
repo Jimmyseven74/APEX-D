@@ -106,7 +106,24 @@ a { color: inherit; }
 
 .foot { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 20px 24px; font-size: 13px; color: var(--muted); border-top: 1px solid var(--line); }
 
+.wordmark { background: none; border: 0; padding: 0; cursor: pointer; color: var(--ink); font-family: inherit; }
+.link { background: none; border: 0; padding: 0; margin-top: 16px; color: var(--green); font: 500 15px/1.4 inherit; font-family: inherit; text-decoration: underline; cursor: pointer; }
+.back { background: none; border: 0; padding: 0 0 12px; color: var(--muted); font: 500 15px/1 inherit; font-family: inherit; cursor: pointer; }
+.eyebrow { margin: 0 0 12px; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--green); }
+.actions { display: grid; gap: 10px; margin-top: 20px; }
+.actions .btn-secondary { margin-top: 0; }
+.note { margin-top: 14px; }
+.manual { display: grid; gap: 14px; margin-top: 18px; }
+.manual label { display: grid; gap: 6px; font-weight: 600; font-size: 15px; }
+.manual input { height: 48px; padding: 0 14px; border: 1px solid var(--line); border-radius: var(--r-sm); font: 400 16px/1 inherit; font-family: inherit; }
+.optional { font-weight: 400; color: var(--muted); }
+.btn-small { min-height: 44px; padding: 0 14px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface); font: 600 14px/1 inherit; font-family: inherit; cursor: pointer; }
+.tiles { display: grid; gap: 8px; margin-top: 16px; }
+.tile { display: flex; gap: 10px; align-items: center; min-height: 52px; padding: 0 16px; border: 1px dashed #c9cdd2; border-radius: var(--r-md); background: var(--bg); font: 500 15px/1 inherit; font-family: inherit; color: var(--ink); cursor: pointer; text-align: left; }
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--ink); color: #fff; padding: 12px 16px; border-radius: var(--r-md); font-size: 14px; animation: fade 200ms cubic-bezier(0.23, 1, 0.32, 1); }
+
 @keyframes enter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes shimmer { to { background-position: -200% 0; } }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }

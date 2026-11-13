@@ -45,8 +45,48 @@ export function isPlausibleReg(input: string): boolean {
   return r.length >= 2 && r.length <= 7 && /[A-Z]/.test(r) && /[0-9]/.test(r);
 }
 
+// "Format" a normalised reg for display: current-style (AB12CDE) gets a space.
+function display(r: string): string {
+  return /^[A-Z]{2}[0-9]{2}[A-Z]{3}$/.test(r) ? `${r.slice(0, 4)} ${r.slice(4)}` : r;
+}
+
+const POOL: Array<Pick<VehicleResult, "make" | "model" | "colour">> = [
+  { make: "Ford", model: "Fiesta", colour: "Grey" },
+  { make: "Vauxhall", model: "Corsa", colour: "Red" },
+  { make: "Nissan", model: "Qashqai", colour: "Black" },
+  { make: "BMW", model: "3 Series", colour: "Silver" },
+  { make: "Kia", model: "Sportage", colour: "Blue" },
+];
+
+function addDays(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function statusFor(days: number): Status {
+  return days < 0 ? "expired" : days <= 30 ? "due-soon" : "valid";
+}
+
+// Any plausible reg returns a car: known demo cars, otherwise one generated from the reg.
+// "ZZ" anywhere in the reg simulates a failed lookup, so the manual route can be tested.
 export async function lookup(input: string): Promise<VehicleResult | null> {
   await new Promise((res) => setTimeout(res, 900));
-  const hit = DEMO[normalise(input)];
-  return hit ? { ...hit, retrievedAt: new Date().toISOString() } : null;
+  const r = normalise(input);
+  const retrievedAt = new Date().toISOString();
+  if (DEMO[r]) return { ...DEMO[r], retrievedAt };
+  if (r.includes("ZZ")) return null;
+
+  const seed = [...r].reduce((n, c) => n + c.charCodeAt(0), 0);
+  const car = POOL[seed % POOL.length];
+  const motDays = (seed * 7) % 300 - 20;
+  const taxDays = (seed * 13) % 330 + 10;
+  return {
+    registration: display(r),
+    ...car,
+    year: 2010 + (seed % 14),
+    mot: { status: statusFor(motDays), date: addDays(motDays) },
+    tax: { status: statusFor(taxDays), date: addDays(taxDays) },
+    retrievedAt,
+  };
 }
